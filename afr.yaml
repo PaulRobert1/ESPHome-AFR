@@ -1,0 +1,543 @@
+substitutions:
+  devicename: diy_lambda_meter
+  heater_pin: GPIO27
+  o2_adc_pin: GPIO36
+  warmup_seconds: "30"
+  gasoline_stoich: "14.7"
+  air_target_v: "0.10"     # target lean/free-air baseline after calibration
+  cal_hold_time: "3s"
+
+esphome:
+  name: ${devicename}
+  friendly_name: DIY Lambda Meter
+  on_boot:
+    priority: 600
+    then:
+      - light.turn_on:
+          id: backlight
+          brightness: 100%
+      - if:
+          condition:
+            lambda: 'return id(heater_auto_enabled);'
+          then:
+            - switch.turn_on: heater_output
+            - lambda: |-
+                id(heater_warmup_remaining) = ${warmup_seconds};
+          else:
+            - switch.turn_off: heater_output
+            - lambda: |-
+                id(heater_warmup_remaining) = 0;
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+globals:
+  - id: screen_mode
+    type: int
+    restore_value: yes
+    initial_value: '0'   # 0=AFR, 1=Lambda, 2=Raw
+
+  - id: heater_auto_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+  - id: heater_warmup_remaining
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: air_cal_valid
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: air_cal_baseline_v
+    type: float
+    restore_value: yes
+    initial_value: '0.10'
+
+  - id: air_cal_correction_v
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  - id: ui_notice
+    type: int
+    restore_value: no
+    initial_value: '0'
+    # 0=none, 1=cal saved, 2=wait hot, 3=no signal, 4=heater on, 5=heater off
+
+  - id: ui_notice_seconds
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 40
+
+  - file: "gfonts://Roboto"
+    id: font_mid
+    size: 20
+
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 13
+
+output:
+  - platform: ledc
+    pin: GPIO4
+    id: backlight_pwm
+    frequency: 1000 Hz
+
+light:
+  - platform: monochromatic
+    id: backlight
+    internal: true
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO19
+
+switch:
+  - platform: gpio
+    id: heater_output
+    internal: true
+    restore_mode: ALWAYS_OFF
+    pin: ${heater_pin}
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(heater_auto_enabled) && id(heater_warmup_remaining) > 0) {
+            id(heater_warmup_remaining)--;
+          }
+          if (id(ui_notice_seconds) > 0) {
+            id(ui_notice_seconds)--;
+            if (id(ui_notice_seconds) <= 0) {
+              id(ui_notice) = 0;
+            }
+          }
+
+binary_sensor:
+  - platform: status
+    name: "Lambda Meter Status"
+
+  # Right button on T-Display: change screen
+  - platform: gpio
+    id: mode_button
+    pin:
+      number: GPIO35
+      inverted: true
+    filters:
+      - delayed_on_off: 20ms
+    on_release:
+      then:
+        - lambda: |-
+            id(screen_mode)++;
+            if (id(screen_mode) > 2) {
+              id(screen_mode) = 0;
+            }
+
+  # Left button on T-Display:
+  # short press = heater auto ON/OFF
+  # hold = air calibration
+  - platform: gpio
+    id: heater_button
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on_off: 20ms
+    on_multi_click:
+      # short press: toggle heater automation
+      - timing:
+          - ON for at most 700ms
+          - OFF for at least 50ms
+        then:
+          - lambda: |-
+              id(heater_auto_enabled) = !id(heater_auto_enabled);
+              if (id(heater_auto_enabled)) {
+                id(heater_warmup_remaining) = ${warmup_seconds};
+                id(ui_notice) = 4;
+                id(ui_notice_seconds) = 2;
+              } else {
+                id(heater_warmup_remaining) = 0;
+                id(ui_notice) = 5;
+                id(ui_notice_seconds) = 2;
+              }
+          - if:
+              condition:
+                lambda: 'return id(heater_auto_enabled);'
+              then:
+                - switch.turn_on: heater_output
+              else:
+                - switch.turn_off: heater_output
+
+      # long hold: air calibration while still held
+      - timing:
+          - ON for at least ${cal_hold_time}
+        then:
+          - lambda: |-
+              float raw = id(o2_raw_voltage).state;
+
+              if (isnan(raw)) {
+                id(ui_notice) = 3;          // NO SIGNAL
+                id(ui_notice_seconds) = 3;
+                return;
+              }
+
+              if (!id(heater_auto_enabled) || id(heater_warmup_remaining) > 0) {
+                id(ui_notice) = 2;          // WAIT HOT
+                id(ui_notice_seconds) = 3;
+                return;
+              }
+
+              float corr = ${air_target_v} - raw;
+
+              // Keep calibration sane; this is only an offset trim
+              if (corr > 0.15f) corr = 0.15f;
+              if (corr < -0.15f) corr = -0.15f;
+
+              id(air_cal_baseline_v) = raw;
+              id(air_cal_correction_v) = corr;
+              id(air_cal_valid) = true;
+
+              id(ui_notice) = 1;            // CAL SAVED
+              id(ui_notice_seconds) = 3;
+
+sensor:
+  - platform: adc
+    pin: ${o2_adc_pin}
+    id: o2_raw_voltage
+    name: "O2 Raw Voltage"
+    attenuation: 0db
+    update_interval: 100ms
+    samples: 16
+    filters:
+      - sliding_window_moving_average:
+          window_size: 8
+          send_every: 1
+
+  - platform: template
+    id: o2_corrected_voltage
+    name: "O2 Corrected Voltage"
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    update_interval: 100ms
+    lambda: |-
+      float v = id(o2_raw_voltage).state;
+      if (isnan(v)) return NAN;
+
+      if (id(air_cal_valid)) {
+        v += id(air_cal_correction_v);
+      }
+
+      if (v < 0.02f) v = 0.02f;
+      if (v > 0.95f) v = 0.95f;
+      return v;
+
+  - platform: template
+    id: o2_raw_millivolts
+    name: "O2 Raw mV"
+    unit_of_measurement: "mV"
+    accuracy_decimals: 0
+    update_interval: 100ms
+    lambda: |-
+      if (isnan(id(o2_raw_voltage).state)) return NAN;
+      return id(o2_raw_voltage).state * 1000.0f;
+
+  - platform: template
+    id: o2_corrected_millivolts
+    name: "O2 Corrected mV"
+    unit_of_measurement: "mV"
+    accuracy_decimals: 0
+    update_interval: 100ms
+    lambda: |-
+      if (isnan(id(o2_corrected_voltage).state)) return NAN;
+      return id(o2_corrected_voltage).state * 1000.0f;
+
+  - platform: template
+    id: est_lambda
+    name: "Estimated Lambda"
+    unit_of_measurement: "λ"
+    accuracy_decimals: 3
+    update_interval: 100ms
+    lambda: |-
+      float v = id(o2_corrected_voltage).state;
+      if (isnan(v)) return NAN;
+
+      // Narrowband approximation near stoich only
+      float lambda_est = 1.00f;
+
+      if (v <= 0.10f) {
+        lambda_est = 1.08f;
+      } else if (v <= 0.45f) {
+        lambda_est = 1.08f - ((v - 0.10f) / 0.35f) * 0.08f;   // 1.08 -> 1.00
+      } else if (v <= 0.80f) {
+        lambda_est = 1.00f - ((v - 0.45f) / 0.35f) * 0.06f;   // 1.00 -> 0.94
+      } else {
+        lambda_est = 0.92f;
+      }
+
+      return lambda_est;
+
+  - platform: template
+    id: est_afr
+    name: "Estimated AFR"
+    unit_of_measurement: ":1"
+    accuracy_decimals: 2
+    update_interval: 100ms
+    lambda: |-
+      float l = id(est_lambda).state;
+      if (isnan(l)) return NAN;
+      return l * ${gasoline_stoich};
+
+  - platform: template
+    id: heater_remaining_sensor
+    name: "O2 Heater Warmup Remaining"
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(heater_warmup_remaining);
+
+  - platform: template
+    id: air_cal_baseline_mv
+    name: "O2 Air Calibration Baseline"
+    unit_of_measurement: "mV"
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      return id(air_cal_baseline_v) * 1000.0f;
+
+text_sensor:
+  - platform: template
+    id: heater_state_text
+    name: "O2 Heater State"
+    update_interval: 250ms
+    lambda: |-
+      if (!id(heater_auto_enabled)) return {"OFF"};
+      if (id(heater_warmup_remaining) > 0) return {"WARMUP"};
+      return {"ON"};
+
+  - platform: template
+    id: calibration_state_text
+    name: "O2 Calibration State"
+    update_interval: 250ms
+    lambda: |-
+      if (id(ui_notice) == 1) return {"CAL SAVED"};
+      if (id(ui_notice) == 2) return {"WAIT HOT"};
+      if (id(ui_notice) == 3) return {"NO SIGNAL"};
+      if (!id(air_cal_valid)) return {"NO CAL"};
+      return {"AIR CAL OK"};
+
+display:
+  - platform: mipi_spi
+    model: T-DISPLAY
+    cs_pin: GPIO5
+    dc_pin: GPIO16
+    reset_pin: GPIO23
+    rotation: "90°"
+    update_interval: 100ms
+    lambda: |-
+      it.fill(Color(0, 0, 0));
+
+      const int w = it.get_width();
+      const int h = it.get_height();
+      const int cx = w / 2;
+
+      float raw_v = id(o2_raw_voltage).state;
+      float corr_v = id(o2_corrected_voltage).state;
+      float raw_mv = id(o2_raw_millivolts).state;
+      float corr_mv = id(o2_corrected_millivolts).state;
+      float afr = id(est_afr).state;
+      float lambda_v = id(est_lambda).state;
+
+      bool heater_auto = id(heater_auto_enabled);
+      bool heater_warming = heater_auto && id(heater_warmup_remaining) > 0;
+
+      std::string title = "AFR";
+      std::string value = "--.--";
+      std::string unit = "";
+      std::string mix = "NO SIG";
+      std::string heater_txt = "HTR OFF";
+      std::string notice = "";
+
+      if (!isnan(corr_v)) {
+        if (corr_v < 0.35f) mix = "LEAN";
+        else if (corr_v > 0.55f) mix = "RICH";
+        else mix = "STOICH";
+      }
+
+      if (!heater_auto) {
+        heater_txt = "HTR OFF";
+      } else if (heater_warming) {
+        char buf[20];
+        snprintf(buf, sizeof(buf), "HTR %ds", id(heater_warmup_remaining));
+        heater_txt = buf;
+      } else {
+        heater_txt = "HTR ON";
+      }
+
+      switch (id(ui_notice)) {
+        case 1: notice = "AIR CAL SAVED"; break;
+        case 2: notice = "WAIT HOT"; break;
+        case 3: notice = "NO SIGNAL"; break;
+        case 4: notice = "HEATER ON"; break;
+        case 5: notice = "HEATER OFF"; break;
+        default: break;
+      }
+
+      char buf[32];
+
+      if (id(screen_mode) == 0) {
+        title = "AFR";
+        if (!isnan(afr)) {
+          snprintf(buf, sizeof(buf), "%.2f", afr);
+          value = buf;
+        } else {
+          value = "--.--";
+        }
+      } else if (id(screen_mode) == 1) {
+        title = "LAMBDA";
+        if (!isnan(lambda_v)) {
+          snprintf(buf, sizeof(buf), "%.3f", lambda_v);
+          value = buf;
+        } else {
+          value = "--.--";
+        }
+      } else {
+        title = "RAW";
+        if (!isnan(raw_mv)) {
+          snprintf(buf, sizeof(buf), "%.0f", raw_mv);
+          value = buf;
+          unit = "mV";
+        } else {
+          value = "---";
+        }
+      }
+
+      // Header
+      it.print(8, 6, id(font_mid), title.c_str());
+
+      if (!heater_auto) {
+        it.print(w - 6, 8, id(font_small), Color(255, 80, 80), TextAlign::TOP_RIGHT, heater_txt.c_str());
+      } else if (heater_warming) {
+        it.print(w - 6, 8, id(font_small), Color(255, 210, 0), TextAlign::TOP_RIGHT, heater_txt.c_str());
+      } else {
+        it.print(w - 6, 8, id(font_small), Color(0, 255, 140), TextAlign::TOP_RIGHT, heater_txt.c_str());
+      }
+
+      // Main big number
+      it.print(cx, 28, id(font_big), Color(235, 235, 235), TextAlign::TOP_CENTER, value.c_str());
+      if (unit.size() > 0) {
+        it.print(cx, 71, id(font_small), Color(160, 160, 160), TextAlign::TOP_CENTER, unit.c_str());
+      }
+
+      // Status line
+      if (notice.size() > 0) {
+        it.print(cx, 84, id(font_mid), Color(120, 190, 255), TextAlign::TOP_CENTER, notice.c_str());
+      } else {
+        if (mix == "LEAN") {
+          it.print(cx, 84, id(font_mid), Color(255, 180, 0), TextAlign::TOP_CENTER, mix.c_str());
+        } else if (mix == "RICH") {
+          it.print(cx, 84, id(font_mid), Color(0, 255, 140), TextAlign::TOP_CENTER, mix.c_str());
+        } else if (mix == "STOICH") {
+          it.print(cx, 84, id(font_mid), Color(235, 235, 235), TextAlign::TOP_CENTER, mix.c_str());
+        } else {
+          it.print(cx, 84, id(font_mid), Color(180, 180, 180), TextAlign::TOP_CENTER, mix.c_str());
+        }
+      }
+
+      // Info line
+      if (!isnan(raw_v) && !isnan(corr_v)) {
+        if (id(screen_mode) == 2) {
+          snprintf(buf, sizeof(buf), "RAW %.3fV  CAL %.0fmV", raw_v, id(air_cal_baseline_v) * 1000.0f);
+        } else {
+          snprintf(buf, sizeof(buf), "RAW %.0fmV  CORR %.0fmV", raw_mv, corr_mv);
+        }
+        it.print(cx, 104, id(font_small), Color(150, 150, 150), TextAlign::TOP_CENTER, buf);
+      }
+
+      // Automotive-style graph
+      const int gx = 10;
+      const int gy = 122;
+      const int gw = 220;
+      const int gh = 14;
+
+      // background + border
+      it.filled_rectangle(gx, gy, gw, gh, Color(14, 14, 14));
+      it.rectangle(gx, gy, gw, gh, Color(80, 80, 80));
+
+      // colored zones
+      int lean_end = gx + 1 + (int)(((0.35f - 0.05f) / 0.85f) * (gw - 2));
+      int stoich_end = gx + 1 + (int)(((0.55f - 0.05f) / 0.85f) * (gw - 2));
+
+      if (lean_end > gx + 1) {
+        it.filled_rectangle(gx + 1, gy + 1, lean_end - (gx + 1), gh - 2, Color(70, 35, 0));
+      }
+      if (stoich_end > lean_end) {
+        it.filled_rectangle(lean_end, gy + 1, stoich_end - lean_end, gh - 2, Color(70, 70, 70));
+      }
+      if (gx + gw - 1 > stoich_end) {
+        it.filled_rectangle(stoich_end, gy + 1, (gx + gw - 1) - stoich_end, gh - 2, Color(0, 60, 28));
+      }
+
+      // Stoich window marks
+      it.line(lean_end, gy - 3, lean_end, gy + gh + 3, Color(150, 150, 150));
+      it.line(stoich_end, gy - 3, stoich_end, gy + gh + 3, Color(150, 150, 150));
+
+      // Pointer + trailing fill
+      if (!isnan(corr_v)) {
+        float norm = (corr_v - 0.05f) / 0.85f;
+        if (norm < 0.0f) norm = 0.0f;
+        if (norm > 1.0f) norm = 1.0f;
+
+        int px = gx + 1 + (int)(norm * (gw - 2));
+
+        Color fill_color = Color(255, 180, 0);
+        if (corr_v > 0.55f) {
+          fill_color = Color(0, 220, 120);
+        } else if (corr_v >= 0.35f) {
+          fill_color = Color(220, 220, 220);
+        }
+
+        int fill_w = px - (gx + 1);
+        if (fill_w > 0) {
+          it.filled_rectangle(gx + 1, gy + 3, fill_w, gh - 6, fill_color);
+        }
+
+        // moving needle
+        it.line(px, gy - 5, px, gy + gh + 5, Color(255, 255, 255));
+      }
+
+      // Labels
+      it.print(gx, gy + 18, id(font_small), Color(120, 120, 120), "LEAN");
+      it.print(cx, gy + 18, id(font_small), Color(140, 140, 140), TextAlign::TOP_CENTER, "STOICH");
+      it.print(gx + gw, gy + 18, id(font_small), Color(120, 120, 120), TextAlign::TOP_RIGHT, "RICH");
